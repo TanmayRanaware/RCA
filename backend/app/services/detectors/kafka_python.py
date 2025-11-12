@@ -17,7 +17,13 @@ class PythonKafkaDetector:
         # Consumer patterns
         self.consumer_patterns = [
             (r"consumer\.subscribe\(\[['\"]([^'\"]+)['\"]", "consumer"),
-            (r"KafkaConsumer\(['\"]([^'\"]+)['\"]", "kafka-python"),
+            # Match KafkaConsumer("topic" on same line
+            (r"KafkaConsumer\(\s*['\"]([^'\"]+)['\"]", "kafka-python"),
+            # Match KafkaConsumer( and extract topic from next lines (handles multi-line)
+            # Pattern: KafkaConsumer(\n    "topic-name",\n    ...
+            (r"KafkaConsumer\(", "kafka-python-multiline"),
+            # Also match KafkaConsumer("topic", ...) with newlines between
+            (r"KafkaConsumer\(\s*\n\s*['\"]([^'\"]+)['\"]", "kafka-python"),
             (r"confluent_kafka\.Consumer\([^)]*\)\.subscribe\(\[['\"]([^'\"]+)['\"]", "confluent-kafka"),
         ]
     
@@ -27,9 +33,20 @@ class PythonKafkaDetector:
         
         # Detect producers
         for pattern, library in self.producer_patterns:
-            matches = re.finditer(pattern, content, re.MULTILINE)
+            matches = re.finditer(pattern, content, re.MULTILINE | re.DOTALL)
             for match in matches:
-                topic = match.group(1)
+                if len(match.groups()) > 0:
+                    topic = match.group(1)
+                else:
+                    # Try to extract topic from next line
+                    match_end = match.end()
+                    next_lines = content[match_end:match_end+200]  # Look ahead 200 chars
+                    topic_match = re.search(r"['\"]([^'\"]+)['\"]", next_lines)
+                    if topic_match:
+                        topic = topic_match.group(1)
+                    else:
+                        continue
+                
                 line_num = content[:match.start()].count("\n") + 1
                 
                 findings.append({
@@ -42,11 +59,28 @@ class PythonKafkaDetector:
                     "confidence": 0.85,
                 })
         
-        # Detect consumers
+        # Detect consumers - handle multi-line KafkaConsumer calls
         for pattern, library in self.consumer_patterns:
-            matches = re.finditer(pattern, content, re.MULTILINE)
+            matches = re.finditer(pattern, content, re.MULTILINE | re.DOTALL)
             for match in matches:
-                topic = match.group(1)
+                topic = None
+                if len(match.groups()) > 0:
+                    topic = match.group(1)
+                elif library == "kafka-python-multiline":
+                    # For KafkaConsumer( pattern, extract topic from next lines
+                    match_end = match.end()
+                    next_lines = content[match_end:match_end+500]  # Look ahead 500 chars for multi-line
+                    # Look for quoted string (topic name) - usually first quoted string after opening paren
+                    # Skip whitespace and newlines
+                    topic_match = re.search(r"['\"]([a-z0-9_-]+)['\"]", next_lines)
+                    if topic_match:
+                        topic = topic_match.group(1)
+                else:
+                    continue
+                
+                if not topic:
+                    continue
+                
                 line_num = content[:match.start()].count("\n") + 1
                 
                 findings.append({

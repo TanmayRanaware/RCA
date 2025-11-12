@@ -7,6 +7,8 @@ import { api } from '@/lib/api'
 interface ChatDockProps {
   onHighlightNodes: (nodeIds: string[]) => void
   onHighlightLinks: (linkIds: string[]) => void
+  onSourceNode?: (nodeId: string | undefined) => void
+  onChangedNodes?: (nodeIds: string[]) => void
   selectedNode?: any
   messages: Array<{ role: 'user' | 'assistant'; content: string; timestamp: string }>
   setMessages: (messages: Array<{ role: 'user' | 'assistant'; content: string; timestamp: string }>) => void
@@ -17,6 +19,8 @@ type ToolMode = 'chat' | 'error-analyzer' | 'what-if' | 'nlq'
 export default function ChatDock({ 
   onHighlightNodes, 
   onHighlightLinks,
+  onSourceNode,
+  onChangedNodes,
   selectedNode,
   messages,
   setMessages
@@ -58,35 +62,86 @@ export default function ChatDock({
       if (toolMode === 'error-analyzer' || (toolMode === 'chat' && (userMessage.toLowerCase().includes('error') || userMessage.toLowerCase().includes('log')))) {
         // Error Analyzer: user pastes a log → agent detects implicated services/edges
         response = await api.post('/chat/error-analyzer', { log_text: userMessage })
-        if (response.data.affected_nodes) {
+        
+        // Set source node (where error occurred) - RED
+        if (response.data.source_node && onSourceNode) {
+          onSourceNode(String(response.data.source_node))
+        }
+        
+        // Highlight affected nodes (services impacted by error) - YELLOW
+        if (response.data.affected_nodes && Array.isArray(response.data.affected_nodes)) {
           onHighlightNodes(response.data.affected_nodes)
         }
-        if (response.data.affected_links) {
-          onHighlightLinks(response.data.affected_links)
+        
+        // Highlight affected links/edges (between source and affected services) - RED
+        if (response.data.affected_edges && Array.isArray(response.data.affected_edges)) {
+          // Convert edges to link keys for highlighting
+          const linkKeys = response.data.affected_edges.map((edge: any) => 
+            `${edge.source}-${edge.target}`
+          )
+          onHighlightLinks(linkKeys)
         }
       } else if (toolMode === 'what-if' || (toolMode === 'chat' && (userMessage.toLowerCase().includes('what if') || userMessage.toLowerCase().includes('impact') || userMessage.toLowerCase().includes('change')))) {
         // What-If Simulator: user describes a pre-deployment change → agent predicts blast radius
         response = await api.post('/chat/what-if', { 
+          change_description: userMessage,
           repo: selectedNode?.repo || '',
           diff: userMessage,
         })
-        if (response.data.predicted_impacted_nodes) {
-          onHighlightNodes(response.data.predicted_impacted_nodes)
+        
+        // Set changed services (RED) - all changed services
+        if (response.data.changed_service_ids && response.data.changed_service_ids.length > 0) {
+          if (onChangedNodes) {
+            onChangedNodes(response.data.changed_service_ids.map((id: any) => String(id)))
+          }
+          // Also set first one as source node for compatibility
+          if (onSourceNode) {
+            onSourceNode(String(response.data.changed_service_ids[0]))
+          }
+        }
+        
+        // Combine blast radius and risk hotspots as highlighted nodes (GOLDEN)
+        const allAffectedNodes = [
+          ...(response.data.blast_radius_nodes || []),
+          ...(response.data.risk_hotspot_nodes || [])
+        ]
+        if (allAffectedNodes.length > 0) {
+          onHighlightNodes(allAffectedNodes)
+        }
+        
+        // Highlight affected edges (RED) - only edges connecting changed services to blast radius
+        if (response.data.blast_radius_edges && response.data.blast_radius_edges.length > 0) {
+          const linkKeys = response.data.blast_radius_edges.map((edge: any) => 
+            `${edge.source}-${edge.target}`
+          )
+          onHighlightLinks(linkKeys)
         }
       } else if (toolMode === 'nlq' || toolMode === 'chat') {
-        // NLQ: Natural Language Query to DB
-        response = await api.post('/nlq', { question: userMessage })
+        // NLQ: Ask Me - CrewAI agent with database and GitHub access
+        response = await api.post('/chat/nlq', { question: userMessage })
         if (response.data.graph_hints?.highlight_services) {
           onHighlightNodes(response.data.graph_hints.highlight_services)
         }
       }
 
       // Add assistant response
+      let assistantContent = response.data.reasoning || 
+                             response.data.analysis ||
+                             response.data.answer ||
+                             response.data.message || 
+                             (response.data.results ? JSON.stringify(response.data.results, null, 2) : 'Analysis complete.')
+      
+      // For what-if, include blast radius and risk hotspot information
+      if (toolMode === 'what-if' && response.data) {
+        if (response.data.blast_radius_service_names || response.data.risk_hotspot_service_names) {
+          // The reasoning already includes this, but we can enhance it
+          assistantContent = response.data.reasoning || response.data.analysis || assistantContent
+        }
+      }
+      
       const assistantMessage = {
         role: 'assistant' as const,
-        content: response.data.reasoning || 
-                 response.data.message || 
-                 (response.data.results ? JSON.stringify(response.data.results, null, 2) : 'Analysis complete.'),
+        content: assistantContent,
         timestamp: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
       }
       
@@ -160,10 +215,10 @@ export default function ChatDock({
                 ? 'bg-blue-600/80 text-white border-blue-500'
                 : 'bg-slate-700/50 text-gray-300 border-slate-600 hover:bg-slate-700'
             }`}
-            title="Natural Language Query: Ask questions about your graph"
+            title="Ask me anything about your microservices"
           >
             <Database className="w-3 h-3" />
-            NLQ
+            Ask Me
           </button>
         </div>
         
@@ -171,8 +226,8 @@ export default function ChatDock({
         <p className="text-gray-400 text-xs">
           {toolMode === 'error-analyzer' && 'Paste error logs to detect implicated services and edges'}
           {toolMode === 'what-if' && 'Describe changes to predict blast radius and risk hotspots'}
-          {toolMode === 'nlq' && 'Ask questions about your microservice dependencies'}
-          {toolMode === 'chat' && 'Ask questions about your microservice dependencies'}
+          {toolMode === 'nlq' && 'Ask me anything about your microservices'}
+          {toolMode === 'chat' && 'Ask me anything about your microservices'}
         </p>
       </div>
 
@@ -247,8 +302,8 @@ export default function ChatDock({
                 : toolMode === 'what-if'
                 ? 'Describe the change (file+diff or PR link)...'
                 : toolMode === 'nlq'
-                ? 'Ask: "Show services that call auth-service via POST"'
-                : 'Ask about your services, dependencies, or request analysis...'
+                ? 'Ask me anything...'
+                : 'Ask me anything...'
             }
             className="flex-1 px-4 py-2 bg-slate-900 border border-slate-600 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500"
             disabled={loading}

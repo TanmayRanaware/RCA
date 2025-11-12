@@ -69,14 +69,17 @@ class ScanPipeline:
             targets = result.scalars().all()
             
             all_findings = []
+            all_services = {}  # Aggregate services from all repos
+            repo_map = {}  # Map repo_id to Repository object
             
-            # Process each target
+            # First pass: Collect all findings and services from all repos
             for target in targets:
                 # Get repository
                 repo_result = await self.db_session.execute(
                     select(Repository).where(Repository.id == target.repo_id)
                 )
                 repo = repo_result.scalar_one()
+                repo_map[repo.id] = repo
                 
                 # Get commit SHA
                 commit_sha = await self.mcp_client.get_commit_sha(repo.full_name, target.branch)
@@ -88,6 +91,7 @@ class ScanPipeline:
                 files = await self.code_fetch.fetch_repo_files(repo.full_name, target.branch)
                 
                 # Run detectors
+                repo_findings = []
                 for file_info in files:
                     file_path = file_info["path"]
                     content = file_info["content"]
@@ -96,22 +100,64 @@ class ScanPipeline:
                     if language in self.detectors:
                         # Run HTTP detector
                         http_findings = self.detectors[language]["http"].detect(file_path, content)
-                        all_findings.extend(http_findings)
+                        repo_findings.extend(http_findings)
                         
                         # Run Kafka detector
                         kafka_findings = self.detectors[language]["kafka"].detect(file_path, content)
-                        all_findings.extend(kafka_findings)
+                        repo_findings.extend(kafka_findings)
                 
-                # Build services and interactions
-                services = self.graph_builder.build_services_from_findings(
-                    all_findings, repo.full_name, commit_sha
+                # Build services for this repo
+                repo_services = self.graph_builder.build_services_from_findings(
+                    repo_findings, repo.full_name, commit_sha
                 )
-                interactions = self.graph_builder.build_interactions_from_findings(
-                    all_findings, services
-                )
+                
+                # Merge services into all_services (keyed by service name)
+                for service_name, service_data in repo_services.items():
+                    if service_name not in all_services:
+                        all_services[service_name] = service_data
+                    # Keep track of which repo this service belongs to
+                    all_services[service_name]["repo_id"] = repo.id
+                
+                # Add findings with repo context
+                for finding in repo_findings:
+                    finding["repo_id"] = repo.id
+                    finding["repo_full_name"] = repo.full_name
+                all_findings.extend(repo_findings)
+            
+            # Second pass: Build interactions using all services (cross-repo matching)
+            all_interactions = self.graph_builder.build_interactions_from_findings(
+                all_findings, all_services
+            )
+            
+            # Third pass: Save services and interactions grouped by repo
+            for repo_id, repo in repo_map.items():
+                # Get services for this repo
+                repo_services = {
+                    name: data for name, data in all_services.items()
+                    if data.get("repo_id") == repo_id
+                }
+                
+                # Get interactions where source or target is from this repo
+                repo_interactions = []
+                for interaction in all_interactions:
+                    source_name = interaction.get("source_service")
+                    target_name = interaction.get("target_service")
+                    
+                    source_repo_id = all_services.get(source_name, {}).get("repo_id")
+                    target_repo_id = all_services.get(target_name, {}).get("repo_id")
+                    
+                    # Include interaction if source or target is from this repo
+                    if source_repo_id == repo_id or target_repo_id == repo_id:
+                        repo_interactions.append(interaction)
+                
+                # Get commit SHA for this repo
+                target = next(t for t in targets if t.repo_id == repo_id)
+                commit_sha = await self.mcp_client.get_commit_sha(repo.full_name, target.branch)
+                if not commit_sha:
+                    commit_sha = target.commit_sha or "unknown"
                 
                 # Save to database
-                await self._save_to_db(repo, services, interactions, commit_sha)
+                await self._save_to_db(repo, all_services, repo_interactions, commit_sha)
             
             # Update scan status
             scan.status = ScanStatus.SUCCESS
@@ -135,20 +181,25 @@ class ScanPipeline:
     async def _save_to_db(
         self,
         repo: Repository,
-        services: dict,
+        all_services: dict,
         interactions: List[dict],
         commit_sha: str,
     ):
         """Save services and interactions to database"""
         service_map = {}
         
-        # Create or update services
-        for service_name, service_data in services.items():
+        # Create or update services (only real services from scanned repos)
+        for service_name, service_data in all_services.items():
+            # Get the repo_id for this service
+            service_repo_id = service_data.get("repo_id")
+            if not service_repo_id:
+                continue  # Skip if no repo_id (shouldn't happen)
+            
             # Check if service exists
             result = await self.db_session.execute(
                 select(Service).where(
                     Service.name == service_name,
-                    Service.repo_id == repo.id
+                    Service.repo_id == service_repo_id
                 )
             )
             service = result.scalar_one_or_none()
@@ -156,7 +207,7 @@ class ScanPipeline:
             if not service:
                 service = Service(
                     name=service_name,
-                    repo_id=repo.id,
+                    repo_id=service_repo_id,
                     language=service_data.get("language"),
                     path_hint=service_data.get("path_hint"),
                     last_commit_sha=commit_sha,
@@ -166,7 +217,7 @@ class ScanPipeline:
             
             service_map[service_name] = service
         
-        # Create interactions
+        # Create interactions (only between real services)
         for interaction_data in interactions:
             source_name = interaction_data.get("source_service")
             target_name = interaction_data.get("target_service")
@@ -174,49 +225,41 @@ class ScanPipeline:
             source_service = service_map.get(source_name)
             target_service = service_map.get(target_name)
             
+            # Only create interaction if both services exist (real services)
             if not source_service or not target_service:
-                # Create placeholder services if needed
-                if not source_service:
-                    source_service = Service(
-                        name=source_name,
-                        repo_id=repo.id,
-                        last_commit_sha=commit_sha,
-                    )
-                    self.db_session.add(source_service)
-                    await self.db_session.flush()
-                    service_map[source_name] = source_service
-                
-                if not target_service:
-                    # Try to find target in other repos
-                    result = await self.db_session.execute(
-                        select(Service).where(Service.name == target_name).limit(1)
-                    )
-                    target_service = result.scalar_one_or_none()
-                    
-                    if not target_service:
-                        # Create placeholder
-                        target_service = Service(
-                            name=target_name,
-                            repo_id=repo.id,  # Placeholder
-                            last_commit_sha=commit_sha,
-                        )
-                        self.db_session.add(target_service)
-                        await self.db_session.flush()
+                logger.warning(
+                    f"Skipping interaction {source_name} -> {target_name}: "
+                    f"source={source_service is not None}, target={target_service is not None}"
+                )
+                continue
             
-            # Create interaction
-            interaction = Interaction(
-                source_service_id=source_service.id,
-                target_service_id=target_service.id,
-                edge_type=EdgeType(interaction_data["type"]),
-                http_method=interaction_data.get("method"),
-                http_url=interaction_data.get("url"),
-                kafka_topic=interaction_data.get("topic"),
-                confidence=interaction_data.get("confidence", 0.5),
-                evidence=interaction_data.get("file"),
-                source_repo_commit_sha=commit_sha,
-                detector_name=interaction_data.get("detector", "unknown"),
+            # Check if interaction already exists (deduplicate)
+            result = await self.db_session.execute(
+                select(Interaction).where(
+                    Interaction.source_service_id == source_service.id,
+                    Interaction.target_service_id == target_service.id,
+                    Interaction.edge_type == EdgeType(interaction_data["type"]),
+                    Interaction.http_url == interaction_data.get("url"),
+                    Interaction.kafka_topic == interaction_data.get("topic"),
+                )
             )
-            self.db_session.add(interaction)
+            existing = result.scalar_one_or_none()
+            
+            if not existing:
+                # Create interaction
+                interaction = Interaction(
+                    source_service_id=source_service.id,
+                    target_service_id=target_service.id,
+                    edge_type=EdgeType(interaction_data["type"]),
+                    http_method=interaction_data.get("method"),
+                    http_url=interaction_data.get("url"),
+                    kafka_topic=interaction_data.get("topic"),
+                    confidence=interaction_data.get("confidence", 0.5),
+                    evidence=interaction_data.get("file"),
+                    source_repo_commit_sha=commit_sha,
+                    detector_name=interaction_data.get("detector", "unknown"),
+                )
+                self.db_session.add(interaction)
         
         await self.db_session.commit()
     

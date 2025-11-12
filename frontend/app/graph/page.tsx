@@ -14,8 +14,10 @@ export default function GraphPage() {
   const searchParams = useSearchParams()
   const [graphData, setGraphData] = useState<{ nodes: any[]; links: any[] }>({ nodes: [], links: [] })
   const [loading, setLoading] = useState(true)
-  const [highlightedNodes, setHighlightedNodes] = useState<Set<string>>(new Set())
-  const [highlightedLinks, setHighlightedLinks] = useState<Set<string>>(new Set())
+  const [highlightedNodes, setHighlightedNodes] = useState<Set<string>>(new Set())  // Affected services (GOLDEN)
+  const [highlightedLinks, setHighlightedLinks] = useState<Set<string>>(new Set())  // Affected edges (RED)
+  const [sourceNode, setSourceNode] = useState<string | undefined>(undefined)  // Source service (RED)
+  const [changedNodes, setChangedNodes] = useState<Set<string>>(new Set())  // Changed services for what-if (RED)
 
   useEffect(() => {
     // Check if user is authenticated
@@ -37,6 +39,15 @@ export default function GraphPage() {
         const repos = searchParams.get('repos')?.split(',').filter(Boolean) || []
         const params = repos.length > 0 ? { repos } : {}
         const response = await api.get('/graph', { params })
+        console.log('📊 Graph API Response:', {
+          nodesCount: response.data?.nodes?.length || 0,
+          linksCount: response.data?.links?.length || 0,
+          sampleNode: response.data?.nodes?.[0],
+          sampleNodeKeys: response.data?.nodes?.[0] ? Object.keys(response.data.nodes[0]) : [],
+          sampleNodeName: response.data?.nodes?.[0]?.name,
+          sampleNodeNameType: typeof response.data?.nodes?.[0]?.name,
+          allNodes: response.data?.nodes?.map((n: any) => ({ id: n.id, name: n.name, hasName: 'name' in n }))
+        })
         setGraphData(response.data)
         setLoading(false)
       } catch (error) {
@@ -53,6 +64,14 @@ export default function GraphPage() {
 
   const handleHighlightLinks = useCallback((linkIds: string[]) => {
     setHighlightedLinks(new Set(linkIds))
+  }, [])
+
+  const handleSourceNode = useCallback((nodeId: string | undefined) => {
+    setSourceNode(nodeId)
+  }, [])
+
+  const handleChangedNodes = useCallback((nodeIds: string[]) => {
+    setChangedNodes(new Set(nodeIds))
   }, [])
 
   const [selectedNode, setSelectedNode] = useState<any>(null)
@@ -91,6 +110,8 @@ export default function GraphPage() {
           data={graphData}
           highlightedNodes={highlightedNodes}
           highlightedLinks={highlightedLinks}
+          sourceNode={sourceNode}
+          changedNodes={changedNodes}
           onNodeSelect={handleNodeSelect}
           selectedNode={selectedNode}
         />
@@ -101,6 +122,8 @@ export default function GraphPage() {
         <ChatDock
           onHighlightNodes={handleHighlightNodes}
           onHighlightLinks={handleHighlightLinks}
+          onSourceNode={handleSourceNode}
+          onChangedNodes={handleChangedNodes}
           selectedNode={selectedNode}
           messages={messages}
           setMessages={setMessages}

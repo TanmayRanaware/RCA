@@ -1,29 +1,29 @@
 """Natural Language Query agent"""
-from crewai import Agent
+from crewai import Agent, Task, Crew
 from langchain_openai import ChatOpenAI
 from app.config import settings
 from app.db.models import Service, Interaction, Repository
+from app.services.mcp_client import MCPGitHubClient
+from app.services.code_fetch import CodeFetchService
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, or_
-from typing import Dict, Any
-import re
+from sqlalchemy import select
+from typing import Dict, Any, Optional
 import logging
+import asyncio
+import re
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
 
 class NLQAgent:
-    """Agent for processing natural language queries"""
+    """Agent for processing natural language queries with CrewAI"""
     
-    # Allowed tables and columns for safety
-    ALLOWED_TABLES = {
-        "services": ["id", "name", "repo_id", "language"],
-        "interactions": ["id", "source_service_id", "target_service_id", "edge_type", "http_method", "http_url", "kafka_topic"],
-        "repositories": ["id", "full_name", "html_url"],
-    }
-    
-    def __init__(self, db_session: AsyncSession):
+    def __init__(self, db_session: AsyncSession, mcp_client: Optional[MCPGitHubClient] = None):
         self.db_session = db_session
+        self.mcp_client = mcp_client
+        self.code_fetch = CodeFetchService(mcp_client) if mcp_client else None
+        
         self.llm = ChatOpenAI(
             model="gpt-4",
             temperature=0.1,
@@ -31,191 +31,286 @@ class NLQAgent:
         )
         
         self.agent = Agent(
-            role="Natural Language Query Processor",
-            goal="Translate natural language questions into safe database queries",
-            backstory="You are an expert at understanding user questions and generating safe SQL queries.",
+            role="Microservice Knowledge Assistant",
+            goal="Answer questions about microservices, their dependencies, connections, and code by querying the database and GitHub repositories",
+            backstory="""You are an expert assistant that helps users understand their microservice architecture. 
+            You have access to:
+            1. A database containing services, interactions (HTTP and Kafka), and repositories
+            2. GitHub repositories for all microservices in the graph
+            
+            You can answer questions about:
+            - Which services exist and their details
+            - How services are connected (HTTP calls, Kafka topics)
+            - Service dependencies and relationships
+            - Code details from GitHub repositories
+            - Service health, traffic patterns, and architecture
+            
+            Always provide clear, helpful answers with specific details when available.""",
             verbose=True,
             llm=self.llm,
+            allow_delegation=False,
         )
     
     async def query(self, question: str) -> Dict[str, Any]:
-        """Process natural language query"""
-        question_lower = question.lower()
-        
-        # Pattern matching for common queries
-        if "services that call" in question_lower or "calls" in question_lower:
-            return await self._query_service_calls(question)
-        elif "kafka topic" in question_lower or "topic" in question_lower:
-            return await self._query_kafka_topics(question)
-        elif "highest in-degree" in question_lower or "most connected" in question_lower:
-            return await self._query_top_services_by_degree(question)
-        elif "fan-out" in question_lower or "hops" in question_lower:
-            return await self._query_fanout(question)
-        else:
-            # Generic query - use LLM to generate safe SQL
-            return await self._generic_query(question)
-    
-    async def _query_service_calls(self, question: str) -> Dict[str, Any]:
-        """Query services that call a specific service"""
-        # Extract service name from question
-        match = re.search(r'call[s]?\s+([a-z-]+)', question, re.IGNORECASE)
-        if not match:
-            return {"error": "Could not extract service name from question"}
-        
-        target_service_name = match.group(1)
-        
-        # Find target service
-        result = await self.db_session.execute(
-            select(Service).where(Service.name.ilike(f"%{target_service_name}%"))
-        )
-        target_service = result.scalar_one_or_none()
-        
-        if not target_service:
-            return {"results": [], "message": f"Service '{target_service_name}' not found"}
-        
-        # Find services that call it
-        result = await self.db_session.execute(
-            select(Interaction, Service).join(
-                Service, Interaction.source_service_id == Service.id
-            ).where(Interaction.target_service_id == target_service.id)
-        )
-        rows = result.all()
-        
-        results = []
-        for interaction, service in rows:
-            results.append({
-                "service_name": service.name,
-                "method": interaction.http_method,
-                "url": interaction.http_url,
-                "type": interaction.edge_type.value,
-            })
-        
-        return {"results": results, "graph_hints": {"highlight_services": [str(target_service.id)]}}
-    
-    async def _query_kafka_topics(self, question: str) -> Dict[str, Any]:
-        """Query Kafka topics"""
-        # Extract topic name if mentioned
-        match = re.search(r'topic[:\s]+([a-z0-9._-]+)', question, re.IGNORECASE)
-        topic_name = match.group(1) if match else None
-        
-        if topic_name:
-            result = await self.db_session.execute(
-                select(Interaction).where(Interaction.kafka_topic == topic_name)
-            )
-            interactions = result.scalars().all()
+        """Process natural language query using CrewAI"""
+        try:
+            logger.info(f"Processing NLQ question: {question[:100]}...")
             
-            results = []
-            for interaction in interactions:
+            # Step 1: Gather context from database
+            context = await self._gather_context(question)
+            logger.info(f"Gathered context: {len(context['services'])} services, {len(context['interactions'])} interactions")
+            
+            # Step 2: Use CrewAI to answer the question
+            answer = await self._answer_with_crewai(question, context)
+            
+            if not answer or answer.startswith("I encountered an error"):
+                logger.warning(f"CrewAI returned error or empty answer: {answer}")
+            
+            return {
+                "message": answer,
+                "answer": answer,
+            }
+        except Exception as e:
+            import traceback
+            error_trace = traceback.format_exc()
+            logger.error(f"Error in NLQ query: {e}\n{error_trace}", exc_info=True)
+            return {
+                "error": f"Error processing query: {str(e)}",
+                "message": f"I encountered an error while processing your question: {str(e)}. Please try rephrasing it or check the backend logs for details.",
+                "answer": f"I encountered an error while processing your question: {str(e)}. Please try rephrasing it or check the backend logs for details.",
+            }
+    
+    async def _gather_context(self, question: str) -> Dict[str, Any]:
+        """Gather relevant context from database and GitHub"""
+        context = {
+            "services": [],
+            "interactions": [],
+            "repositories": [],
+        }
+        
+        try:
+            # Get all services
+            result = await self.db_session.execute(select(Service))
+            services = result.scalars().all()
+            context["services"] = [
+                {
+                    "id": str(s.id),
+                    "name": s.name,
+                    "language": s.language,
+                    "repo_id": str(s.repo_id),
+                }
+                for s in services
+            ]
+            
+            # Get all interactions
+            result = await self.db_session.execute(select(Interaction))
+            interactions = result.scalars().all()
+            context["interactions"] = []
+            for i in interactions:
+                # Get service names
                 source_result = await self.db_session.execute(
-                    select(Service).where(Service.id == interaction.source_service_id)
+                    select(Service).where(Service.id == i.source_service_id)
                 )
                 target_result = await self.db_session.execute(
-                    select(Service).where(Service.id == interaction.target_service_id)
+                    select(Service).where(Service.id == i.target_service_id)
                 )
-                source = source_result.scalar_one()
-                target = target_result.scalar_one()
+                source = source_result.scalar_one_or_none()
+                target = target_result.scalar_one_or_none()
                 
-                results.append({
-                    "source": source.name,
-                    "target": target.name,
-                    "topic": interaction.kafka_topic,
-                })
+                if source and target:
+                    context["interactions"].append({
+                        "source": source.name,
+                        "target": target.name,
+                        "type": i.edge_type.value,
+                        "http_method": i.http_method,
+                        "http_url": i.http_url,
+                        "kafka_topic": i.kafka_topic,
+                    })
             
-            return {"results": results}
-        else:
-            # List all topics
-            result = await self.db_session.execute(
-                select(Interaction.kafka_topic).distinct().where(Interaction.kafka_topic.isnot(None))
-            )
-            topics = [r[0] for r in result.all()]
-            return {"results": [{"topic": t} for t in topics]}
-    
-    async def _query_top_services_by_degree(self, question: str) -> Dict[str, Any]:
-        """Query top services by in-degree"""
-        # Extract number if specified
-        match = re.search(r'top\s+(\d+)', question, re.IGNORECASE)
-        limit = int(match.group(1)) if match else 5
+            # Get all repositories
+            result = await self.db_session.execute(select(Repository))
+            repositories = result.scalars().all()
+            context["repositories"] = [
+                {
+                    "id": str(r.id),
+                    "full_name": r.full_name,
+                    "html_url": r.html_url,
+                    "default_branch": r.default_branch,
+                }
+                for r in repositories
+            ]
+            
+        except Exception as e:
+            logger.error(f"Error gathering context: {e}")
         
-        # Count in-degree for each service
-        result = await self.db_session.execute(
-            select(
-                Service.id,
-                Service.name,
-                func.count(Interaction.id).label("in_degree")
-            ).join(
-                Interaction, Service.id == Interaction.target_service_id
-            ).group_by(Service.id, Service.name).order_by(
-                func.count(Interaction.id).desc()
-            ).limit(limit)
+        return context
+    
+    async def _answer_with_crewai(self, question: str, context: Dict[str, Any]) -> str:
+        """Use CrewAI to answer the question with context"""
+        # Format context for the agent
+        context_text = f"""
+DATABASE CONTEXT:
+
+Services ({len(context['services'])} total):
+{chr(10).join([f"  - {s['name']} (ID: {s['id']}, Language: {s.get('language', 'unknown')})" for s in context['services'][:50]])}
+{f"... and {len(context['services']) - 50} more services" if len(context['services']) > 50 else ""}
+
+Interactions ({len(context['interactions'])} total):
+{chr(10).join([f"  - {i['source']} -> {i['target']} ({i['type']})" + (f" - {i.get('http_url', i.get('kafka_topic', ''))}" if i.get('http_url') or i.get('kafka_topic') else "") for i in context['interactions'][:50]])}
+{f"... and {len(context['interactions']) - 50} more interactions" if len(context['interactions']) > 50 else ""}
+
+Repositories ({len(context['repositories'])} total):
+{chr(10).join([f"  - {r['full_name']} (Branch: {r.get('default_branch', 'main')})" for r in context['repositories'][:20]])}
+{f"... and {len(context['repositories']) - 20} more repositories" if len(context['repositories']) > 20 else ""}
+
+GITHUB ACCESS:
+{"Available - Can fetch code from repositories" if self.mcp_client else "Not available - No GitHub access token"}
+"""
+        
+        task_description = f"""
+Answer the following question about the microservice architecture:
+
+Question: {question}
+
+{context_text}
+
+Instructions:
+1. Use the database context provided above to answer the question
+2. If you need code details from GitHub repositories, mention that you can access them but focus on the database information first
+3. Provide a clear, helpful answer with specific details
+4. If the question asks about specific services, mention their names, connections, and relevant details
+5. If the question is about dependencies, explain the relationships clearly
+6. Be conversational and helpful - this is a chat interface
+7. Format URLs to be concise - use paths like /users/{{user_id}}/validate instead of full URLs
+8. Keep lines under 80 characters when possible to fit in the chat box
+9. Break long lists into multiple lines with proper indentation
+
+Answer the question directly and clearly. Format your response to be readable in a chat interface.
+"""
+        
+        task = Task(
+            description=task_description,
+            agent=self.agent,
         )
         
-        rows = result.all()
-        results = []
-        for service_id, name, in_degree in rows:
-            results.append({
-                "service_name": name,
-                "in_degree": in_degree,
-            })
-        
-        return {"results": results}
+        try:
+            def run_crew():
+                try:
+                    crew = Crew(
+                        agents=[self.agent],
+                        tasks=[task],
+                        verbose=True,
+                    )
+                    result = crew.kickoff()
+                    return result
+                except Exception as e:
+                    logger.error(f"Error in CrewAI execution: {e}", exc_info=True)
+                    raise
+            
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor() as executor:
+                result_crew = await loop.run_in_executor(executor, run_crew)
+            
+            if not result_crew:
+                logger.warning("CrewAI returned None result")
+                return "I couldn't generate an answer. Please try rephrasing your question."
+            
+            answer = str(result_crew)
+            if not answer or answer.strip() == "":
+                logger.warning("CrewAI returned empty answer")
+                return "I couldn't generate an answer. Please try rephrasing your question."
+            
+            # Format the answer to fit in chat box
+            try:
+                answer = self._format_answer_for_chat(answer)
+            except Exception as e:
+                logger.warning(f"Error formatting answer, using unformatted: {e}")
+                # Continue with unformatted answer if formatting fails
+            
+            return answer
+        except Exception as e:
+            import traceback
+            error_trace = traceback.format_exc()
+            logger.error(f"Error running CrewAI agent: {e}\n{error_trace}", exc_info=True)
+            return f"I encountered an error while processing your question: {str(e)}. Please try rephrasing it."
     
-    async def _query_fanout(self, question: str) -> Dict[str, Any]:
-        """Query fan-out patterns"""
-        # Extract service name and hop count
-        match = re.search(r'(\d+)\s+hop[s]?', question, re.IGNORECASE)
-        hops = int(match.group(1)) if match else 2
+    def _format_url(self, url: str, max_length: int = 50) -> str:
+        """Format URL to fit in chat box"""
+        if not url:
+            return ""
+        if url.startswith('http://') or url.startswith('https://'):
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            path = parsed.path
+            if path:
+                url = path
         
-        match = re.search(r'reach[es]?\s+([a-z-]+)', question, re.IGNORECASE)
-        target_name = match.group(1) if match else None
+        if '{' in url:
+            url = re.sub(r'^\{[^}]+\}', '', url)
+            if url and not url.startswith('/'):
+                url = '/' + url
+            url = re.sub(r'\{[^}]+\}', '{...}', url)
         
-        if not target_name:
-            return {"error": "Could not extract target service name"}
-        
-        # Find target service
-        result = await self.db_session.execute(
-            select(Service).where(Service.name.ilike(f"%{target_name}%"))
-        )
-        target_service = result.scalar_one_or_none()
-        
-        if not target_service:
-            return {"error": f"Service '{target_name}' not found"}
-        
-        # BFS to find services within N hops
-        visited = {str(target_service.id)}
-        current_level = [target_service.id]
-        
-        for _ in range(hops):
-            next_level = []
-            result = await self.db_session.execute(
-                select(Interaction.source_service_id).where(
-                    Interaction.target_service_id.in_(current_level)
-                ).distinct()
-            )
-            for (service_id,) in result.all():
-                if str(service_id) not in visited:
-                    visited.add(str(service_id))
-                    next_level.append(service_id)
-            current_level = next_level
-        
-        # Get service names
-        result = await self.db_session.execute(
-            select(Service).where(Service.id.in_(list(visited)))
-        )
-        services = result.scalars().all()
-        
-        results = [{"service_name": s.name} for s in services]
-        
-        return {
-            "results": results,
-            "graph_hints": {"highlight_services": list(visited)},
-        }
+        if len(url) > max_length:
+            if '/' in url:
+                parts = url.split('/')
+                if len(parts) > 2:
+                    return f"/{parts[1]}/.../{parts[-1]}"
+            return url[:max_length-3] + "..."
+        return url
     
-    async def _generic_query(self, question: str) -> Dict[str, Any]:
-        """Generic query handler using LLM"""
-        # In production, use LLM to generate safe SQL
-        # For now, return a simple response
-        return {
-            "results": [],
-            "message": "Generic query processing not yet implemented. Please use specific query patterns.",
-        }
+    def _format_answer_for_chat(self, answer: str, max_line_length: int = 80) -> str:
+        """Format answer to fit within chat box by wrapping long lines and formatting URLs"""
+        if not answer:
+            return answer
+        
+        try:
+            lines = answer.split('\n')
+            formatted_lines = []
+            
+            for line in lines:
+                try:
+                    # Format URLs in the line
+                    # Match URLs like {SERVICE_URL}/path or http://... or /path
+                    url_pattern = r'(\{[A-Z_]+\_SERVICE_URL\}[^\s\)]+|https?://[^\s\)]+|/[^\s\)]+)'
+                    
+                    def replace_url(match):
+                        try:
+                            url = match.group(1)
+                            formatted = self._format_url(url, max_length=50)
+                            return formatted
+                        except Exception:
+                            return match.group(0)  # Return original if formatting fails
+                    
+                    line = re.sub(url_pattern, replace_url, line)
+                    
+                    # Wrap long lines
+                    if len(line) > max_line_length:
+                        words = line.split(' ')
+                        current_line = []
+                        current_length = 0
+                        
+                        for word in words:
+                            word_length = len(word)
+                            if current_length + word_length + 1 > max_line_length and current_line:
+                                formatted_lines.append(' '.join(current_line))
+                                current_line = [word]
+                                current_length = word_length
+                            else:
+                                current_line.append(word)
+                                current_length += word_length + 1
+                        
+                        if current_line:
+                            formatted_lines.append(' '.join(current_line))
+                    else:
+                        formatted_lines.append(line)
+                except Exception as e:
+                    # If formatting a line fails, just add it as-is
+                    logger.warning(f"Error formatting line, using as-is: {e}")
+                    formatted_lines.append(line)
+            
+            return '\n'.join(formatted_lines)
+        except Exception as e:
+            logger.error(f"Error in _format_answer_for_chat: {e}")
+            return answer  # Return original answer if formatting fails completely
 

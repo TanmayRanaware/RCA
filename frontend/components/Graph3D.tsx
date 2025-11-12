@@ -1,6 +1,6 @@
 'use client'
 
-import { useRef, useEffect, useState, useCallback } from 'react'
+import { useRef, useEffect, useState, useCallback, forwardRef } from 'react'
 import dynamic from 'next/dynamic'
 import * as THREE from 'three'
 import { RotateCcw, X, Check } from 'lucide-react'
@@ -10,31 +10,38 @@ const ForceGraph3D = dynamic(() => import('react-force-graph-3d'), { ssr: false 
 
 interface Graph3DProps {
   data: { nodes: any[]; links: any[] }
-  highlightedNodes?: Set<string>
-  highlightedLinks?: Set<string>
+  highlightedNodes?: Set<string>  // Affected services (GOLDEN)
+  highlightedLinks?: Set<string>  // Affected edges (RED)
+  sourceNode?: string  // Source service where error occurred (RED)
+  changedNodes?: Set<string>  // Changed services for what-if (RED)
   onNodeSelect?: (node: any) => void
   selectedNode?: any
 }
 
-export default function Graph3D({ 
+const Graph3D = forwardRef<any, Graph3DProps>(({ 
   data, 
-  highlightedNodes = new Set(), 
-  highlightedLinks = new Set(),
+  highlightedNodes = new Set(),  // Affected services (GOLDEN)
+  highlightedLinks = new Set(),  // Affected edges (RED)
+  sourceNode,  // Source service where error occurred (RED)
+  changedNodes = new Set(),  // Changed services for what-if (RED)
   onNodeSelect,
   selectedNode
-}: Graph3DProps) {
+}, ref) => {
   const fgRef = useRef<any>()
   const [focusedNode, setFocusedNode] = useState<any>(null)
   const [isReady, setIsReady] = useState(false)
+  
+  // Use forwarded ref or internal ref
+  const graphRef = (ref as any) || fgRef
 
   useEffect(() => {
-    if (fgRef.current && data && data.nodes && data.nodes.length > 0) {
+    if (graphRef.current && data && data.nodes && data.nodes.length > 0) {
       // Spread nodes out more to avoid dense ball
       // Increase charge strength (more negative = more repulsion)
-      fgRef.current.d3Force('charge')?.strength(-300)
+      graphRef.current.d3Force('charge')?.strength(-300)
       
       // Increase link distance to space out connected nodes
-      fgRef.current.d3Force('link')?.distance((link: any) => {
+      graphRef.current.d3Force('link')?.distance((link: any) => {
         // Calculate distance based on number of nodes (more nodes = more space)
         const baseDistance = 150
         const nodeCount = data.nodes.length
@@ -44,22 +51,22 @@ export default function Graph3D({
       
       // Add center force to keep graph centered in the left container
       // Position graph 70% from the right side (more to the left)
-      fgRef.current.d3Force('center')?.strength(0.1)
-      fgRef.current.d3Force('center')?.x(-300) // Shift center more to the left (70% from right)
+      graphRef.current.d3Force('center')?.strength(0.1)
+      graphRef.current.d3Force('center')?.x(-300) // Shift center more to the left (70% from right)
       
       // Initialize camera position - zoomed in to 10% (closer = more zoomed in)
       // Calculate base distance, then reduce to 10% (multiply by 0.10)
       const baseDistance = Math.max(400, data.nodes.length * 3)
       const distance = baseDistance * 0.10 // 10% zoomed in
       // Position camera 70% from the right side
-      fgRef.current.cameraPosition({ x: -300, y: 0, z: distance }, { x: -300, y: 0, z: 0 })
+      graphRef.current.cameraPosition({ x: -300, y: 0, z: distance }, { x: -300, y: 0, z: 0 })
       
       // Auto-rotate like a globe (using orbit controls)
       // Wait a bit for the graph to initialize before accessing controls
       setTimeout(() => {
-        if (fgRef.current) {
+        if (graphRef.current) {
           try {
-            const controls = (fgRef.current as any).controls()
+            const controls = (graphRef.current as any).controls()
             if (controls && typeof controls.autoRotate !== 'undefined') {
               controls.autoRotate = true
               controls.autoRotateSpeed = 1.0 // Tweak speed (0.5–2 feels good)
@@ -70,20 +77,43 @@ export default function Graph3D({
         }
       }, 200)
     }
-  }, [data])
+  }, [data, graphRef])
 
   // Auto-color nodes by repo (like reference example)
   const getNodeColor = (node: any) => {
+    const nodeId = String(node.id)
+    
+    // Check if we're in what-if mode (has changedNodes)
+    const isWhatIfMode = changedNodes.size > 0
+    
+    // Changed services (what-if primary node) - BLUE
+    if (changedNodes.has(nodeId)) {
+      return '#00aaff' // Blue for changed services (primary node in what-if)
+    }
+    
+    // Source service (where error occurred) - RED
+    if (sourceNode && nodeId === String(sourceNode)) {
+      return '#ff0000' // Red for source service
+    }
+    
+    // Affected services: 
+    // - In what-if mode: blast radius/risk hotspots are RED
+    // - In error-analyzer mode: affected services are GOLDEN
+    if (highlightedNodes.has(nodeId)) {
+      if (isWhatIfMode) {
+        return '#ff0000' // Red for blast radius in what-if mode
+      } else {
+        return '#ffd700' // Golden for affected services in error-analyzer mode
+      }
+    }
+    
+    // Selected node - gold
     if (selectedNode?.id === node.id) {
       return '#ffd700' // Gold for selected
     }
-    if (highlightedNodes.has(node.id)) {
-      return '#ff4444' // Red for highlighted
-    }
-    // Auto-color by repo (hash-based) - this will be used by nodeAutoColorBy
-    const hash = node.repo?.split('').reduce((acc: number, char: string) => acc + char.charCodeAt(0), 0) || 0
-    const hue = hash % 360
-    return `hsl(${hue}, 70%, 60%)`
+    
+    // Default - green (unaffected services)
+    return '#00ff00' // Green for default/unaffected nodes
   }
 
   const getNodeTextColor = (node: any) => {
@@ -98,9 +128,9 @@ export default function Graph3D({
   }
 
   const getNodeSize = (node: any) => {
-    // Node size - consistent small size (like text-nodes example)
-    // Small spheres so text is prominent
-    return 4
+    // Node size - very small size (0.1) so text is prominent
+    // Minimal sphere, text labels are the main visual element
+    return 0.1
   }
 
   // Link colors are handled by linkAutoColorBy
@@ -111,10 +141,10 @@ export default function Graph3D({
       onNodeSelect(node)
     }
     // Focus camera on node (like reference)
-    if (fgRef.current) {
+    if (graphRef.current) {
       const distance = 90
       const distRatio = 1 + distance / Math.hypot(node.x || 0, node.y || 0, node.z || 0)
-      fgRef.current.cameraPosition(
+      graphRef.current.cameraPosition(
         {
           x: (node.x || 0) * distRatio,
           y: (node.y || 0) * distRatio,
@@ -124,19 +154,19 @@ export default function Graph3D({
         1000
       )
       // Pause auto-rotate when focusing on node
-      const controls = (fgRef.current as any).controls()
+      const controls = (graphRef.current as any).controls()
       if (controls) {
         controls.autoRotate = false
       }
     }
-  }, [onNodeSelect])
+  }, [onNodeSelect, graphRef])
 
   const handleResetView = () => {
-    if (fgRef.current) {
+    if (graphRef.current) {
       // Reset to left-offset position with 10% zoom (70% from right side)
       const baseDistance = Math.max(400, data.nodes.length * 3)
       const distance = baseDistance * 0.10 // 10% zoomed in
-      fgRef.current.cameraPosition(
+      graphRef.current.cameraPosition(
         { x: -300, y: 0, z: distance },
         { x: -300, y: 0, z: 0 },
         800
@@ -144,7 +174,7 @@ export default function Graph3D({
       setFocusedNode(null)
       setIsReady(false)
       // Resume auto-rotate
-      const controls = (fgRef.current as any)?.controls()
+      const controls = (graphRef.current as any)?.controls()
       if (controls) {
         controls.autoRotate = true
       }
@@ -179,10 +209,35 @@ export default function Graph3D({
     const originalId = node.id || node.name
     const normalizedId = String(originalId)
     nodeIdMap.set(String(originalId), normalizedId)
+    
+    // Debug: Check original node.name before cleaning
+    if (Math.random() < 0.1) { // Log ~10% of nodes
+      console.log('🔍 cleanNodes - Original node:', {
+        originalName: node.name,
+        originalNameType: typeof node.name,
+        originalId: node.id,
+        allKeys: Object.keys(node)
+      })
+    }
+    
+    // Preserve original name if it exists, otherwise use id
+    const preservedName = node.name && String(node.name).trim() !== '' 
+      ? String(node.name) 
+      : (node.id ? String(node.id) : 'node')
+    
+    // Debug: Warn if name is being lost
+    if (node.name && preservedName !== String(node.name)) {
+      console.warn('⚠️ cleanNodes: Name changed!', {
+        original: node.name,
+        preserved: preservedName,
+        node: node
+      })
+    }
+    
     return {
       ...node,
       id: normalizedId,
-      name: String(node.name || node.id || 'node')
+      name: preservedName  // Use preserved name instead of always converting
     }
   })
 
@@ -213,20 +268,55 @@ export default function Graph3D({
     }
   })
 
+  // Detect service pairs with both HTTP and KAFKA edges
+  const edgeTypeMap = new Map<string, Set<string>>() // key: "source-target", value: Set of edge types
+  
+  cleanLinks.forEach((link: any) => {
+    const sourceId = String(link.source)
+    const targetId = String(link.target)
+    const key = `${sourceId}-${targetId}`
+    // Normalize edge type to uppercase (backend sends "HTTP" and "KAFKA")
+    const edgeType = (link.kind || link.type || 'HTTP').toUpperCase()
+    
+    if (!edgeTypeMap.has(key)) {
+      edgeTypeMap.set(key, new Set())
+    }
+    edgeTypeMap.get(key)!.add(edgeType)
+  })
+  
+  // Mark links that are part of dual-connection pairs
+  const cleanLinksWithDualFlag = cleanLinks.map((link: any) => {
+    const sourceId = String(link.source)
+    const targetId = String(link.target)
+    const key = `${sourceId}-${targetId}`
+    const edgeTypes = edgeTypeMap.get(key)
+    
+    // Check if both HTTP and KAFKA exist for this pair
+    const hasBoth = edgeTypes && edgeTypes.has('HTTP') && edgeTypes.has('KAFKA')
+    
+    return {
+      ...link,
+      hasBothTypes: hasBoth || false
+    }
+  })
+
   const cleanData = {
     nodes: cleanNodes,
-    links: cleanLinks
+    links: cleanLinksWithDualFlag
   }
 
-  // Debug: log data structure
-  console.log('Graph data summary:', {
-    originalNodes: data.nodes?.length || 0,
-    originalLinks: data.links?.length || 0,
-    cleanNodes: cleanData.nodes.length,
-    cleanLinks: cleanData.links.length,
-    sampleNode: cleanData.nodes[0],
-    sampleLink: cleanData.links[0]
-  })
+        // Debug: log data structure
+        console.log('Graph data summary:', {
+          originalNodes: data.nodes?.length || 0,
+          originalLinks: data.links?.length || 0,
+          cleanNodes: cleanData.nodes.length,
+          cleanLinks: cleanData.links.length,
+          sampleNode: cleanData.nodes[0],
+          sampleLink: cleanData.links[0],
+          sampleNodeKeys: cleanData.nodes[0] ? Object.keys(cleanData.nodes[0]) : [],
+          sampleNodeName: cleanData.nodes[0]?.name,
+          sampleNodeId: cleanData.nodes[0]?.id
+        })
 
   // Debug: log if data is empty
   if (cleanData.nodes.length === 0) {
@@ -240,6 +330,8 @@ export default function Graph3D({
   if (cleanData.links.length === 0 && data.links && data.links.length > 0) {
     console.warn('No valid links in graph data (filtered out):', data.links)
   }
+
+  // Removed HTML label positioning - using green spheres for now
 
   return (
     <div id="graph-container" className="relative" style={{ width: '100%', height: '100%', background: '#000011' }}>
@@ -279,46 +371,69 @@ export default function Graph3D({
         Left-click: rotate, Mouse-wheel/middle-click: zoom, Right-click: pan
       </div>
 
+      {/* Removed HTML labels - using green spheres for now */}
+
       <ForceGraph3D
-        ref={fgRef}
+        ref={graphRef}
         graphData={cleanData}
         nodeAutoColorBy={(node: any) => node.group || node.repo || 'default'}
-        nodeColor={getNodeColor}
-        nodeVal={getNodeSize}
-        linkColor={() => '#ffffff'}
-        linkWidth={0.2}
+        nodeColor={getNodeColor} // Use getNodeColor function for highlighting
+        nodeVal={0.1} // Very small green sphere
+        linkColor={(link: any) => {
+          // Highlighted links (from error analysis) - thicker and highlighted
+          const sourceId = String(link.source?.id || link.source)
+          const targetId = String(link.target?.id || link.target)
+          const linkKey = `${sourceId}-${targetId}`
+          const reverseLinkKey = `${targetId}-${sourceId}`
+          
+          // Check if this link is highlighted (either direction)
+          const isHighlighted = highlightedLinks.has(linkKey) || highlightedLinks.has(reverseLinkKey) ||
+                                (sourceId && highlightedNodes.has(sourceId)) ||
+                                (targetId && highlightedNodes.has(targetId))
+          
+          if (isHighlighted) {
+            return '#ff6b6b' // Red/orange for highlighted links
+          }
+          
+          // Blue edges if both HTTP and KAFKA exist between the same services
+          if (link.hasBothTypes) {
+            return '#00aaff' // Blue color for dual connections (HTTP + KAFKA)
+          }
+          // White edges for HTTP, Golden edges for Kafka
+          if (link.kind === 'Kafka' || link.type === 'Kafka' || link.kind === 'KAFKA' || link.type === 'KAFKA') {
+            return '#ffd700' // Golden color for Kafka
+          }
+          return '#ffffff' // White color for HTTP
+        }}
+        linkWidth={(link: any) => {
+          // Link width: highlighted links are thinner (0.1px) for subtle highlighting
+          const sourceId = String(link.source?.id || link.source)
+          const targetId = String(link.target?.id || link.target)
+          const linkKey = `${sourceId}-${targetId}`
+          const reverseLinkKey = `${targetId}-${sourceId}`
+          
+          const isHighlighted = highlightedLinks.has(linkKey) || highlightedLinks.has(reverseLinkKey) ||
+                                (sourceId && highlightedNodes.has(sourceId)) ||
+                                (targetId && highlightedNodes.has(targetId))
+          return isHighlighted ? 0.1 : 0.2
+        }}
         linkOpacity={0.6}
         backgroundColor="#000011"
-        // Text nodes above nodes (like reference example)
-        nodeThreeObject={(node: any) => {
-          // Use SpriteText from three-spritetext (exactly like reference example)
-          if (!node || (!node.name && !node.id)) {
-            return null
-          }
-          try {
-            const sprite = new SpriteText(node.name || node.id)
-            sprite.material.depthWrite = false // Make sprite background transparent
-            sprite.color = node.color || '#ffffff' // Use auto-colored node color
-            sprite.textHeight = 8
-            sprite.center.y = -0.6 // Shift text above node (exactly like reference)
-            return sprite
-          } catch (error) {
-            console.error('Error creating SpriteText:', error, node)
-            return null
-          }
-        }}
-        nodeThreeObjectExtend={true} // Keep the node sphere AND add text (like reference)
+        // Make nodeLabel always visible (not just on hover)
+        showNavInfo={false}
+        // Removed nodeThreeObject - using simple green spheres for now
+        // Remove nodeLabel to avoid HTML labels interfering with 3D text
+        nodeLabel={undefined}
         onNodeClick={handleNodeClick}
         // Force simulation settings for better spacing
-        d3Force="link"
         d3AlphaDecay={0.02}
         d3VelocityDecay={0.4}
         cooldownTicks={200} // More ticks for better layout
         onEngineStop={() => {
-          if (fgRef.current && !isReady) {
+          if (graphRef.current && !isReady) {
             try {
               // Get graph bounding box to calculate center offset
-              const bbox = fgRef.current.getGraphBbox()
+              const bbox = graphRef.current.getGraphBbox()
               const centerX = (bbox.x[0] + bbox.x[1]) / 2
               const centerY = (bbox.y[0] + bbox.y[1]) / 2
               const centerZ = (bbox.z[0] + bbox.z[1]) / 2
@@ -331,7 +446,7 @@ export default function Graph3D({
               // Zoom in to 10% (reduce distance to 10% of base)
               const baseDistance = Math.max(400, data.nodes.length * 3)
               const distance = baseDistance * 0.10 // 10% zoomed in
-              fgRef.current.cameraPosition(
+              graphRef.current.cameraPosition(
                 { x: lookAt.x, y: lookAt.y, z: lookAt.z + distance },
                 lookAt,
                 800
@@ -339,8 +454,8 @@ export default function Graph3D({
               
               // Re-center after a short delay to ensure layout is stable
               setTimeout(() => {
-                if (fgRef.current) {
-                  const bbox2 = fgRef.current.getGraphBbox()
+                if (graphRef.current) {
+                  const bbox2 = graphRef.current.getGraphBbox()
                   const centerX2 = (bbox2.x[0] + bbox2.x[1]) / 2
                   const centerY2 = (bbox2.y[0] + bbox2.y[1]) / 2
                   const centerZ2 = (bbox2.z[0] + bbox2.z[1]) / 2
@@ -348,7 +463,7 @@ export default function Graph3D({
                   // Use same 10% zoom distance
                   const baseDistance2 = Math.max(400, data.nodes.length * 3)
                   const distance2 = baseDistance2 * 0.10 // 10% zoomed in
-                  fgRef.current.cameraPosition(
+                  graphRef.current.cameraPosition(
                     { x: lookAt2.x, y: lookAt2.y, z: lookAt2.z + distance2 },
                     lookAt2,
                     800
@@ -361,7 +476,7 @@ export default function Graph3D({
               console.warn('Error in camera positioning:', error)
               // Fallback to simple zoomToFit
               try {
-                fgRef.current.zoomToFit(800, 100)
+                graphRef.current.zoomToFit(800, 100)
               } catch (e) {
                 console.warn('Error in zoomToFit:', e)
               }
@@ -373,5 +488,9 @@ export default function Graph3D({
       />
     </div>
   )
-}
+})
+
+Graph3D.displayName = 'Graph3D'
+
+export default Graph3D
 

@@ -73,30 +73,55 @@ async def get_graph(
             repo = repo_result.scalar_one()
             
             stats = service_stats.get(service_id, {"inDegree": 0, "outDegree": 0})
-            nodes.append({
+            
+            # Debug: Check service.name before adding to nodes
+            service_name = service.name
+            if not service_name or service_name.strip() == '':
+                print(f"⚠️ WARNING: Service {service_id} has empty name! Service object: {service}")
+            
+            node_data = {
                 "id": service_id,
-                "name": service.name,
+                "name": service_name,  # Use the checked service_name
                 "group": repo.full_name,  # Use repo as group for auto-coloring
                 "repo": repo.full_name,
                 "language": service.language or "unknown",
                 "inDegree": stats["inDegree"],
                 "outDegree": stats["outDegree"],
                 "url": repo.html_url,
-            })
+            }
+            
+            # Debug: Log first few nodes
+            if len(nodes) < 3:
+                print(f"🔍 Building node {len(nodes)}: {node_data}")
+            
+            nodes.append(node_data)
         
         # Build links
+        # Track bidirectional HTTP edges (if A->B and B->A exist, mark as bidirectional)
+        link_map = {}  # (source_id, target_id) -> link data
         links = []
+        
         for interaction in interactions:
             source_id = service_map.get(interaction.source_service_id)
             target_id = service_map.get(interaction.target_service_id)
             
             if source_id and target_id:
+                # For HTTP: Check if reverse edge exists (bidirectional)
+                is_bidirectional = False
+                if interaction.edge_type.value == "HTTP":
+                    reverse_key = (target_id, source_id)
+                    if reverse_key in link_map:
+                        # Mark both as bidirectional
+                        link_map[reverse_key]["bidirectional"] = True
+                        is_bidirectional = True
+                
                 link = {
                     "source": source_id,
                     "target": target_id,
                     "kind": interaction.edge_type.value,  # Use 'kind' for linkAutoColorBy
                     "type": interaction.edge_type.value,  # Keep for backward compatibility
                     "confidence": interaction.confidence,
+                    "bidirectional": is_bidirectional,
                 }
                 
                 if interaction.edge_type.value == "HTTP":
@@ -107,6 +132,7 @@ async def get_graph(
                     link["topic"] = interaction.kafka_topic
                     link["via"] = interaction.kafka_topic  # Use 'via' for link labels
                 
+                link_map[(source_id, target_id)] = link
                 links.append(link)
         
         return {"nodes": nodes, "links": links}
